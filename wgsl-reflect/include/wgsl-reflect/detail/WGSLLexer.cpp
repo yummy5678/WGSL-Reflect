@@ -284,15 +284,15 @@ namespace wgsl_reflect
             if (Peek() == '&')
             {
                 Advance(); Advance();
-                return MakeToken(TokenType::AmpAmp, "&&", startLine, startCol);
+                return MakeToken(TokenType::AmpersandAmpersand, "&&", startLine, startCol);
             }
             if (Peek() == '=')
             {
                 Advance(); Advance();
-                return MakeToken(TokenType::AmpEqual, "&=", startLine, startCol);
+                return MakeToken(TokenType::AmpersandEqual, "&=", startLine, startCol);
             }
             Advance();
-            return MakeToken(TokenType::Amp, "&", startLine, startCol);
+            return MakeToken(TokenType::Ampersand, "&", startLine, startCol);
 
             // --- '|' 系: ||, |=, | ---
         case '|':

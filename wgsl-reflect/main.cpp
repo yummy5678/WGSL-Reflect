@@ -169,6 +169,16 @@ const PARTICLE_COUNT : u32 = 1024;
 const BUFFER_SIZE : u32 = MAX_LIGHTS * 4;
 const PI : f32 = 3.14159;
 const HALF_PI : f32 = PI / 2.0;
+const MIN_VAL : i32 = min(10, 20);
+const MAX_VAL : i32 = max(10, 20);
+const CLAMPED : i32 = clamp(100, 0, 50);
+const ABS_VAL : i32 = abs(-42);
+const SQRT_16 = sqrt(16.0);
+const POW_2_10 = pow(2.0, 10.0);
+const CEIL_VAL = ceil(2.3);
+const FLOOR_VAL = floor(2.7);
+const ROUND_VAL = round(2.5);
+const LOG2_VAL = log2(256.0);
 
 // --- パイプライン定数 ---
 @id(0) override screen_width : f32 = 1920.0;
@@ -511,6 +521,27 @@ int main()
     assert(data.constants["BUFFER_SIZE"] == "64");
     assert(data.constants.count("MAX_LIGHTS") > 0);
     assert(data.constants["MAX_LIGHTS"] == "16");
+    // 組み込み関数の定数評価
+    assert(data.constants["MIN_VAL"] == "10");
+    assert(data.constants["MAX_VAL"] == "20");
+    assert(data.constants["CLAMPED"] == "50");
+    assert(data.constants["ABS_VAL"] == "42");
+    assert(data.constants["SQRT_16"] == "4");
+    assert(data.constants["POW_2_10"] == "1024");
+    assert(data.constants["CEIL_VAL"] == "3");
+    assert(data.constants["FLOOR_VAL"] == "2");
+    assert(data.constants["ROUND_VAL"] == "3");
+    assert(data.constants["LOG2_VAL"] == "8");
+    std::cout << "  MIN_VAL=" << data.constants["MIN_VAL"]
+        << ", MAX_VAL=" << data.constants["MAX_VAL"]
+        << ", CLAMPED=" << data.constants["CLAMPED"]
+        << ", ABS_VAL=" << data.constants["ABS_VAL"]
+        << ", SQRT_16=" << data.constants["SQRT_16"]
+        << ", POW_2_10=" << data.constants["POW_2_10"]
+        << ", CEIL_VAL=" << data.constants["CEIL_VAL"]
+        << ", FLOOR_VAL=" << data.constants["FLOOR_VAL"]
+        << ", ROUND_VAL=" << data.constants["ROUND_VAL"]
+        << ", LOG2_VAL=" << data.constants["LOG2_VAL"] << "\n";
 
     // override定数のID
     assert(data.overrideConstants.size() == 4);
@@ -585,7 +616,93 @@ int main()
     assert(flat[0].offset == 0);
     assert(flat[0].size == 64);
 
-    std::cout << "全ての検証に合格しました\n";
+    // ========================================
+    //  エントリーポイントごとのリソース使用
+    // ========================================
+    PrintSection("エントリーポイントごとのリソース使用");
+    for (const auto& ep : data.entryPoints)
+    {
+        std::cout << "  [" << ep.name << "] 使用バインディング数: " << ep.usedBindings.size() << "\n";
+        for (const auto& ref : ep.usedBindings)
+        {
+            std::cout << "    group(" << ref.group << ") binding(" << ref.binding << ")\n";
+        }
+    }
+
+    // vs_main は scene を使用（group0/binding0）
+    bool vs_uses_scene = false;
+    for (const auto& ref : data.entryPoints[0].usedBindings)
+    {
+        if (ref.group == 0 && ref.binding == 0) vs_uses_scene = true;
+    }
+    assert(vs_uses_scene);
+
+    // fs_main は diffuseTexture, texSampler を使用
+    bool fs_uses_diffuse = false, fs_uses_sampler = false;
+    for (const auto& ref : data.entryPoints[1].usedBindings)
+    {
+        if (ref.group == 1 && ref.binding == 0) fs_uses_diffuse = true;
+        if (ref.group == 1 && ref.binding == 4) fs_uses_sampler = true;
+    }
+    assert(fs_uses_diffuse);
+    assert(fs_uses_sampler);
+
+    // cs_update は particles, particlesOut を使用
+    bool cs_uses_in = false, cs_uses_out = false;
+    for (const auto& ref : data.entryPoints[2].usedBindings)
+    {
+        if (ref.group == 0 && ref.binding == 1) cs_uses_in = true;
+        if (ref.group == 0 && ref.binding == 2) cs_uses_out = true;
+    }
+    assert(cs_uses_in);
+    assert(cs_uses_out);
+
+    // ========================================
+    //  配列型の詳細情報
+    // ========================================
+    PrintSection("配列型の詳細情報");
+    // particles: array<Particle> → 実行時サイズ配列
+    assert(data.bindings[1].arrayInfo.has_value());
+    assert(data.bindings[1].arrayInfo->isRuntimeSized == true);
+    assert(data.bindings[1].arrayInfo->elementType == "Particle");
+    std::cout << "  particles: 要素型=" << data.bindings[1].arrayInfo->elementType
+        << ", 実行時サイズ=" << (data.bindings[1].arrayInfo->isRuntimeSized ? "はい" : "いいえ")
+        << ", ストライド=" << data.bindings[1].arrayInfo->stride << "\n";
+
+    assert(data.bindings[2].arrayInfo.has_value());
+    assert(data.bindings[2].arrayInfo->isRuntimeSized == true);
+    std::cout << "  particlesOut: 要素型=" << data.bindings[2].arrayInfo->elementType
+        << ", 実行時サイズ=" << (data.bindings[2].arrayInfo->isRuntimeSized ? "はい" : "いいえ")
+        << ", ストライド=" << data.bindings[2].arrayInfo->stride << "\n";
+
+    // scene（非配列）はarrayInfoなし
+    assert(!data.bindings[0].arrayInfo.has_value());
+
+    // ========================================
+    //  atomic型の検出テスト
+    // ========================================
+    PrintSection("atomic型の検出");
+    {
+        const std::string atomicShader = R"(
+            @group(0) @binding(0) var<storage, read_write> counter : atomic<u32>;
+            @group(0) @binding(1) var<storage, read> data : array<f32, 64>;
+            @compute @workgroup_size(1)
+            fn main() {}
+        )";
+        wgsl_reflect::ReflectionData ad;
+        wgsl_reflect::ReflectionResult ar = wgsl_reflect::Reflect(atomicShader, ad);
+        assert(ar.success);
+        assert(ad.bindings[0].isAtomic == true);
+        assert(ad.bindings[1].isAtomic == false);
+        assert(ad.bindings[1].arrayInfo.has_value());
+        assert(ad.bindings[1].arrayInfo->isRuntimeSized == false);
+        assert(ad.bindings[1].arrayInfo->elementCount == 64);
+        assert(ad.bindings[1].arrayInfo->stride == 4);
+        std::cout << "  counter: isAtomic=はい\n";
+        std::cout << "  data: isAtomic=いいえ, 要素数=" << ad.bindings[1].arrayInfo->elementCount
+            << ", ストライド=" << ad.bindings[1].arrayInfo->stride << "\n";
+    }
+    std::cout << "  全テスト合格\n";
 
     // ========================================
     //  エラーケースのテスト

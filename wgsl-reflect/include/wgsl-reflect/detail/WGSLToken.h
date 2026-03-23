@@ -66,7 +66,7 @@ namespace wgsl_reflect
         StarEqual,       // *=: 乗算代入
         SlashEqual,      // /=: 除算代入
         PercentEqual,    // %=: 剰余代入
-        AmpEqual,        // &=: ビット積代入
+        AmpersandEqual,  // &=: ビット積代入
         PipeEqual,       // |=: ビット和代入
         CaretEqual,      // ^=: ビット排他的論理和代入
         ShiftLeftEqual,  // <<=: 左シフト代入
@@ -87,12 +87,12 @@ namespace wgsl_reflect
         // < と > は LeftAngle, RightAngle と兼用
 
         // --- 論理演算子 ---
-        AmpAmp,          // &&: 論理積（短絡評価）
+        AmpersandAmpersand,// &&: 論理積（短絡評価）
         PipePipe,        // ||: 論理和（短絡評価）
         Bang,            // !: 論理否定
 
         // --- ビット演算子 ---
-        Amp,             // &: ビット積（参照取得も兼ねる）
+        Ampersand,       // &: ビット積（参照取得も兼ねる）
         Pipe,            // |: ビット和
         Caret,           // ^: ビット排他的論理和
         Tilde,           // ~: ビット反転
