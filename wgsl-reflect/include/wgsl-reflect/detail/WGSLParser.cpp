@@ -1,6 +1,5 @@
 #include "WGSLParser.h"
 #include <algorithm>
-#include <cassert>
 #include <cmath>
 #include <cstdlib>
 #include <functional>
@@ -148,7 +147,7 @@ ReflectionResult Parser::Parse(ReflectionData& outData)
     m_constantValues.clear();
     m_typeLayouts.clear();
     m_functions.clear();
-    m_nextOverrideId = 0;
+    m_transitiveResourceCache.clear();
 
     // トークン列をすべて走査して宣言を解析する
     while (!IsAtEnd() && !HasError())
@@ -173,6 +172,12 @@ ReflectionResult Parser::Parse(ReflectionData& outData)
 
         // エントリーポイントごとのリソース使用状況を解析
         AnalyzeResourceUsage();
+
+        // テクスチャとサンプラーの関連付けを解析
+        AnalyzeTextureSamplerRelations();
+
+        // 全関数の情報を公開用にエクスポート
+        ExportFunctionDefinitions();
     }
 
     // 結果を構築して返す
@@ -258,7 +263,7 @@ bool Parser::Match(TokenType type)
 bool Parser::Expect(TokenType type, const std::string& context)
 {
     if (Current().type == type) { Advance(); return true; }
-    ReportErrorAtCurrent(context + " で '" + Current().text +
+    ReportError(context + " で '" + Current().text +
         "' が見つかりましたが、想定外のトークンです");
     return false;
 }
@@ -294,14 +299,6 @@ void Parser::ReportError(const std::string& message)
 }
 
 /**
- * @brief ReportError()と同一の機能（名前で意味を明確化するためのラッパー）
- */
-void Parser::ReportErrorAtCurrent(const std::string& message)
-{
-    ReportError(message);
-}
-
-/**
  * @brief エラーが1件以上記録されているかを返す
  * @return エラーがあればtrue
  */
@@ -319,6 +316,211 @@ bool Parser::HasError() const
 SourceLocation Parser::CurrentSourceLocation() const
 {
     return { Current().line, Current().column };
+}
+
+// ############################################################
+//  ユーティリティ関数
+// ############################################################
+
+/**
+ * @brief 文字列の前後の空白を除去して返す
+ * @param str 対象の文字列
+ * @return 前後の空白を除去した新しい文字列
+ */
+std::string Parser::TrimString(const std::string& str)
+{
+    size_t start = 0;
+    size_t end = str.size();
+    while (start < end && str[start] == ' ') start++;
+    while (end > start && str[end - 1] == ' ') end--;
+    return str.substr(start, end - start);
+}
+
+/**
+ * @brief StructMemberの属性情報をStageIOに転写して生成する
+ * @param member 転写元の構造体メンバー
+ * @param direction 入力か出力かの方向
+ * @return 生成されたStageIO
+ *
+ * ResolveEntryPointIO()で構造体メンバーを個別のステージ入出力に
+ * 展開する際に使用する。同じ転写処理が入力展開と出力展開で
+ * 必要になるため、共通化してここにまとめている。
+ */
+StageIO Parser::MakeStageIOFromMember(const StructMember& member, IODirection direction)
+{
+    StageIO io;
+    io.name          = member.name;
+    io.typeName      = member.typeName;
+    io.direction     = direction;
+    io.location      = member.location;
+    io.index         = member.index;
+    io.builtin       = member.builtin;
+    io.interpolation = member.interpolation;
+    io.invariant     = member.invariant;
+    return io;
+}
+
+/**
+ * @brief "array<...>" 形式の型名から内部の要素型と要素数文字列に分割する
+ * @param typeName 型名の完全な文字列
+ * @return 分割結果。配列型でなければnullopt
+ *
+ * ExtractArrayInfo()とCalculateTypeLayout()の両方で使われる
+ * 配列型名の内部パース処理を共通化した関数。
+ * 山括弧のネスト深度を追跡して最外のカンマ位置を正確に特定する。
+ */
+std::optional<Parser::ArrayInnerParts> Parser::SplitArrayInner(const std::string& typeName)
+{
+    const std::string prefix = "array<";
+    if (typeName.find(prefix) != 0) return std::nullopt;
+
+    // "array<" と末尾の ">" を除いた中身を取り出す
+    std::string inner = typeName.substr(prefix.size(), typeName.size() - prefix.size() - 1);
+
+    // 最外のカンマ位置を山括弧のネスト深度を追跡して探す
+    int depth = 0;
+    size_t splitPos = std::string::npos;
+    for (size_t i = 0; i < inner.size(); i++)
+    {
+        if (inner[i] == '<') depth++;
+        else if (inner[i] == '>') depth--;
+        else if (inner[i] == ',' && depth == 0) splitPos = i;
+    }
+
+    ArrayInnerParts parts;
+    if (splitPos != std::string::npos)
+    {
+        parts.elementType = TrimString(inner.substr(0, splitPos));
+        parts.countStr    = TrimString(inner.substr(splitPos + 1));
+        parts.hasCount    = true;
+    }
+    else
+    {
+        parts.elementType = TrimString(inner);
+        parts.countStr    = "";
+        parts.hasCount    = false;
+    }
+    return parts;
+}
+
+/**
+ * @brief 組み込み関数を整数引数で評価する
+ * @param name 関数名
+ * @param args 引数リスト
+ * @return 評価結果。未知の関数名または引数数不一致ならnullopt
+ *
+ * EvaluateConstantExpressionAsInt() のparsePrimary内で使用する。
+ * 対応する組み込み関数と引数数の組み合わせを1箇所で管理し、
+ * 整数版と浮動小数点版の評価関数間での関数リストの重複を排除する。
+ */
+std::optional<int64_t> Parser::EvaluateBuiltinFunctionInt(
+    const std::string& name, const std::vector<int64_t>& args)
+{
+    if (args.size() == 1)
+    {
+        int64_t a = args[0];
+        double  d = static_cast<double>(a);
+
+        if (name == "abs")   return std::abs(a);
+        if (name == "sign")  return (a > 0) ? int64_t(1) : (a < 0) ? int64_t(-1) : int64_t(0);
+        if (name == "ceil")  return static_cast<int64_t>(std::ceil(d));
+        if (name == "floor") return static_cast<int64_t>(std::floor(d));
+        if (name == "round") return static_cast<int64_t>(std::round(d));
+        if (name == "trunc") return static_cast<int64_t>(std::trunc(d));
+        if (name == "sqrt")  return static_cast<int64_t>(std::sqrt(d));
+        if (name == "log")   return static_cast<int64_t>(std::log(d));
+        if (name == "log2")  return static_cast<int64_t>(std::log2(d));
+        if (name == "exp")   return static_cast<int64_t>(std::exp(d));
+        if (name == "exp2")  return static_cast<int64_t>(std::exp2(d));
+        if (name == "sin")   return static_cast<int64_t>(std::sin(d));
+        if (name == "cos")   return static_cast<int64_t>(std::cos(d));
+        if (name == "tan")   return static_cast<int64_t>(std::tan(d));
+        if (name == "asin")  return static_cast<int64_t>(std::asin(d));
+        if (name == "acos")  return static_cast<int64_t>(std::acos(d));
+        if (name == "atan")  return static_cast<int64_t>(std::atan(d));
+    }
+    else if (args.size() == 2)
+    {
+        int64_t a = args[0], b = args[1];
+        if (name == "min")   return std::min(a, b);
+        if (name == "max")   return std::max(a, b);
+        if (name == "pow")   return static_cast<int64_t>(std::pow(static_cast<double>(a), static_cast<double>(b)));
+        if (name == "atan2") return static_cast<int64_t>(std::atan2(static_cast<double>(a), static_cast<double>(b)));
+    }
+    else if (args.size() == 3)
+    {
+        if (name == "clamp") return std::clamp(args[0], args[1], args[2]);
+    }
+    return std::nullopt;
+}
+
+/**
+ * @brief 組み込み関数を浮動小数点引数で評価する
+ * @param name 関数名
+ * @param args 引数リスト
+ * @return 評価結果。未知の関数名または引数数不一致ならnullopt
+ */
+std::optional<double> Parser::EvaluateBuiltinFunctionFloat(
+    const std::string& name, const std::vector<double>& args)
+{
+    if (args.size() == 1)
+    {
+        double a = args[0];
+        if (name == "abs")   return std::abs(a);
+        if (name == "sign")  return (a > 0.0) ? 1.0 : (a < 0.0) ? -1.0 : 0.0;
+        if (name == "ceil")  return std::ceil(a);
+        if (name == "floor") return std::floor(a);
+        if (name == "round") return std::round(a);
+        if (name == "trunc") return std::trunc(a);
+        if (name == "sqrt")  return std::sqrt(a);
+        if (name == "log")   return std::log(a);
+        if (name == "log2")  return std::log2(a);
+        if (name == "exp")   return std::exp(a);
+        if (name == "exp2")  return std::exp2(a);
+        if (name == "sin")   return std::sin(a);
+        if (name == "cos")   return std::cos(a);
+        if (name == "tan")   return std::tan(a);
+        if (name == "asin")  return std::asin(a);
+        if (name == "acos")  return std::acos(a);
+        if (name == "atan")  return std::atan(a);
+    }
+    else if (args.size() == 2)
+    {
+        double a = args[0], b = args[1];
+        if (name == "min")   return std::fmin(a, b);
+        if (name == "max")   return std::fmax(a, b);
+        if (name == "pow")   return std::pow(a, b);
+        if (name == "atan2") return std::atan2(a, b);
+    }
+    else if (args.size() == 3)
+    {
+        if (name == "clamp") return std::fmin(std::fmax(args[0], args[1]), args[2]);
+    }
+    return std::nullopt;
+}
+
+/**
+ * @brief 推移的リソース解決をキャッシュ付きで行う
+ * @param funcName 起点の関数名
+ * @return この関数が直接的・間接的に参照するバインディング変数名の集合
+ *
+ * ResolveTransitiveResources()の結果をキャッシュし、
+ * 同じ関数に対する2回目以降の呼び出しではキャッシュから返す。
+ * AnalyzeResourceUsage()とExportFunctionDefinitions()の両方から
+ * 呼ばれるため、キャッシュにより二重計算を回避する。
+ */
+const std::set<std::string>& Parser::ResolveTransitiveResourcesCached(
+    const std::string& funcName)
+{
+    auto cacheIt = m_transitiveResourceCache.find(funcName);
+    if (cacheIt != m_transitiveResourceCache.end())
+    {
+        return cacheIt->second;
+    }
+
+    std::set<std::string> visited;
+    m_transitiveResourceCache[funcName] = ResolveTransitiveResources(funcName, visited);
+    return m_transitiveResourceCache[funcName];
 }
 
 // ############################################################
@@ -577,7 +779,7 @@ std::string Parser::ParseType()
     }
     else
     {
-        ReportErrorAtCurrent("型名が必要です");
+        ReportError("型名が必要です");
         return "";
     }
 
@@ -873,52 +1075,11 @@ int64_t Parser::EvaluateConstantExpressionAsInt()
                 }
                 Match(TokenType::RightParen);
 
-                // --- 引数1つの組み込み関数 ---
-                if (args.size() == 1)
-                {
-                    int64_t a = args[0];
-                    double  d = static_cast<double>(a);
+                // 組み込み関数の評価を試みる
+                auto builtinResult = EvaluateBuiltinFunctionInt(name, args);
+                if (builtinResult.has_value()) return builtinResult.value();
 
-                    if (name == "abs")   return std::abs(a);
-                    if (name == "sign")  return (a > 0) ? static_cast<int64_t>(1)
-                                              : (a < 0) ? static_cast<int64_t>(-1)
-                                              : static_cast<int64_t>(0);
-                    // 以下の数学関数はdoubleで計算してint64_tに丸めて返す
-                    if (name == "ceil")  return static_cast<int64_t>(std::ceil(d));
-                    if (name == "floor") return static_cast<int64_t>(std::floor(d));
-                    if (name == "round") return static_cast<int64_t>(std::round(d));
-                    if (name == "trunc") return static_cast<int64_t>(std::trunc(d));
-                    if (name == "sqrt")  return static_cast<int64_t>(std::sqrt(d));
-                    if (name == "log")   return static_cast<int64_t>(std::log(d));
-                    if (name == "log2")  return static_cast<int64_t>(std::log2(d));
-                    if (name == "exp")   return static_cast<int64_t>(std::exp(d));
-                    if (name == "exp2")  return static_cast<int64_t>(std::exp2(d));
-                    if (name == "sin")   return static_cast<int64_t>(std::sin(d));
-                    if (name == "cos")   return static_cast<int64_t>(std::cos(d));
-                    if (name == "tan")   return static_cast<int64_t>(std::tan(d));
-                    if (name == "asin")  return static_cast<int64_t>(std::asin(d));
-                    if (name == "acos")  return static_cast<int64_t>(std::acos(d));
-                    if (name == "atan")  return static_cast<int64_t>(std::atan(d));
-                }
-                // --- 引数2つの組み込み関数 ---
-                else if (args.size() == 2)
-                {
-                    int64_t a = args[0], b = args[1];
-                    double da = static_cast<double>(a);
-                    double db = static_cast<double>(b);
-
-                    if (name == "min")   return std::min(a, b);
-                    if (name == "max")   return std::max(a, b);
-                    if (name == "pow")   return static_cast<int64_t>(std::pow(da, db));
-                    if (name == "atan2") return static_cast<int64_t>(std::atan2(da, db));
-                }
-                // --- 引数3つの組み込み関数 ---
-                else if (args.size() == 3)
-                {
-                    if (name == "clamp") return std::clamp(args[0], args[1], args[2]);
-                }
-
-                // 上記のいずれにも該当しない場合は型コンストラクタとみなし、
+                // 組み込み関数に該当しない場合は型コンストラクタとみなし、
                 // 第1引数の値をそのまま返す（u32(123) → 123）
                 return args.empty() ? static_cast<int64_t>(0) : args[0];
             }
@@ -1102,44 +1263,9 @@ double Parser::EvaluateConstantExpressionAsFloat()
                 }
                 Match(TokenType::RightParen);
 
-                // --- 引数1つの組み込み関数 ---
-                if (args.size() == 1)
-                {
-                    double a = args[0];
-
-                    if (name == "abs")   return std::abs(a);
-                    if (name == "sign")  return (a > 0.0) ? 1.0 : (a < 0.0) ? -1.0 : 0.0;
-                    if (name == "ceil")  return std::ceil(a);
-                    if (name == "floor") return std::floor(a);
-                    if (name == "round") return std::round(a);
-                    if (name == "trunc") return std::trunc(a);
-                    if (name == "sqrt")  return std::sqrt(a);
-                    if (name == "log")   return std::log(a);
-                    if (name == "log2")  return std::log2(a);
-                    if (name == "exp")   return std::exp(a);
-                    if (name == "exp2")  return std::exp2(a);
-                    if (name == "sin")   return std::sin(a);
-                    if (name == "cos")   return std::cos(a);
-                    if (name == "tan")   return std::tan(a);
-                    if (name == "asin")  return std::asin(a);
-                    if (name == "acos")  return std::acos(a);
-                    if (name == "atan")  return std::atan(a);
-                }
-                // --- 引数2つの組み込み関数 ---
-                else if (args.size() == 2)
-                {
-                    double a = args[0], b = args[1];
-
-                    if (name == "min")   return std::fmin(a, b);
-                    if (name == "max")   return std::fmax(a, b);
-                    if (name == "pow")   return std::pow(a, b);
-                    if (name == "atan2") return std::atan2(a, b);
-                }
-                // --- 引数3つの組み込み関数 ---
-                else if (args.size() == 3)
-                {
-                    if (name == "clamp") return std::fmin(std::fmax(args[0], args[1]), args[2]);
-                }
+                // 組み込み関数の評価を試みる
+                auto builtinResult = EvaluateBuiltinFunctionFloat(name, args);
+                if (builtinResult.has_value()) return builtinResult.value();
 
                 // 型コンストラクタとして第1引数を返す
                 return args.empty() ? 0.0 : args[0];
@@ -1270,7 +1396,7 @@ void Parser::ParseEnable()
         }
         else
         {
-            ReportErrorAtCurrent("enable指令に機能名が必要です");
+            ReportError("enable指令に機能名が必要です");
             return;
         }
 
@@ -1312,7 +1438,7 @@ void Parser::ParseRequires()
         }
         else
         {
-            ReportErrorAtCurrent("requires指令に要件名が必要です");
+            ReportError("requires指令に要件名が必要です");
             return;
         }
 
@@ -1358,7 +1484,7 @@ void Parser::ParseDiagnostic(bool isGlobal)
     }
     else
     {
-        ReportErrorAtCurrent("diagnostic指令に重大度が必要です");
+        ReportError("diagnostic指令に重大度が必要です");
         return;
     }
 
@@ -1420,48 +1546,19 @@ DiagnosticSeverity Parser::ParseDiagnosticSeverity(const std::string& text) cons
  */
 std::optional<ArrayInfo> Parser::ExtractArrayInfo(const std::string& typeName) const
 {
-    const std::string prefix = "array<";
-    if (typeName.find(prefix) != 0) return std::nullopt;
+    auto parts = SplitArrayInner(typeName);
+    if (!parts.has_value()) return std::nullopt;
 
     ArrayInfo info;
+    info.elementType = parts->elementType;
 
-    // "array<" と末尾の ">" を除いた中身を取り出す
-    std::string inner = typeName.substr(
-        prefix.size(), typeName.size() - prefix.size() - 1);
-
-    // 最後のカンマ位置をネスト深度0で探す
-    // （array<vec4<f32>, 10> のように型引数にカンマを含む場合があるため、
-    //  山括弧のネスト深度を追跡して最外のカンマのみを対象にする）
-    int depth = 0;
-    size_t splitPos = std::string::npos;
-    for (size_t i = 0; i < inner.size(); i++)
+    if (parts->hasCount)
     {
-        if (inner[i] == '<') depth++;
-        else if (inner[i] == '>') depth--;
-        else if (inner[i] == ',' && depth == 0) splitPos = i;
-    }
-
-    if (splitPos != std::string::npos)
-    {
-        // カンマがある → 固定サイズ配列 array<要素型, 要素数>
-        info.elementType = inner.substr(0, splitPos);
-        while (!info.elementType.empty() && info.elementType.back() == ' ')
-            info.elementType.pop_back();
-
-        std::string countStr = inner.substr(splitPos + 1);
-        while (!countStr.empty() && countStr.front() == ' ')
-            countStr.erase(countStr.begin());
-
-        info.elementCount = static_cast<uint32_t>(
-            std::strtoul(countStr.c_str(), nullptr, 0));
+        info.elementCount   = static_cast<uint32_t>(std::strtoul(parts->countStr.c_str(), nullptr, 0));
         info.isRuntimeSized = false;
     }
     else
     {
-        // カンマがない → 実行時サイズ配列 array<要素型>
-        info.elementType = inner;
-        while (!info.elementType.empty() && info.elementType.back() == ' ')
-            info.elementType.pop_back();
         info.elementCount   = 0;
         info.isRuntimeSized = true;
     }
@@ -1470,7 +1567,6 @@ std::optional<ArrayInfo> Parser::ExtractArrayInfo(const std::string& typeName) c
     TypeLayout elemLayout = CalculateTypeLayout(info.elementType);
     if (elemLayout.size > 0 && elemLayout.align > 0)
     {
-        // ストライド = 要素サイズをアライメントの倍数に切り上げ
         info.stride = (elemLayout.size + elemLayout.align - 1) /
                       elemLayout.align * elemLayout.align;
     }
@@ -1512,7 +1608,7 @@ void Parser::ParseStruct(const std::vector<Attribute>& attributes)
     // 構造体名を読み取る
     if (Current().type != TokenType::Identifier)
     {
-        ReportErrorAtCurrent("struct宣言に構造体名がありません");
+        ReportError("struct宣言に構造体名がありません");
         return;
     }
     StructDefinition structDef;
@@ -1539,7 +1635,7 @@ void Parser::ParseStruct(const std::vector<Attribute>& attributes)
         // メンバー名
         if (Current().type != TokenType::Identifier)
         {
-            ReportErrorAtCurrent("構造体メンバー名が必要です");
+            ReportError("構造体メンバー名が必要です");
             return;
         }
         member.name = Current().text;
@@ -1665,7 +1761,7 @@ void Parser::ParseVar(const std::vector<Attribute>& attributes)
     // 変数名
     if (Current().type != TokenType::Identifier)
     {
-        ReportErrorAtCurrent("var宣言に変数名がありません");
+        ReportError("var宣言に変数名がありません");
         return;
     }
     std::string varName = Current().text;
@@ -1747,7 +1843,7 @@ void Parser::ParseConst()
     // 定数名
     if (Current().type != TokenType::Identifier)
     {
-        ReportErrorAtCurrent("const宣言に定数名がありません");
+        ReportError("const宣言に定数名がありません");
         return;
     }
     std::string constName = Current().text;
@@ -1810,7 +1906,7 @@ void Parser::ParseOverride(const std::vector<Attribute>& attributes)
     // 定数名
     if (Current().type != TokenType::Identifier)
     {
-        ReportErrorAtCurrent("override宣言に定数名がありません");
+        ReportError("override宣言に定数名がありません");
         return;
     }
     oc.name = Current().text;
@@ -1865,7 +1961,7 @@ void Parser::ParseFunction(const std::vector<Attribute>& attributes)
     // 関数名
     if (Current().type != TokenType::Identifier)
     {
-        ReportErrorAtCurrent("fn宣言に関数名がありません");
+        ReportError("fn宣言に関数名がありません");
         return;
     }
     std::string funcName = Current().text;
@@ -1877,10 +1973,10 @@ void Parser::ParseFunction(const std::vector<Attribute>& attributes)
         if (attr.name == "diagnostic" && attr.arguments.size() >= 2)
         {
             DiagnosticDirective diag;
-            diag.isGlobal  = false;
+            diag.isGlobal = false;
             diag.sourceLoc = { attr.line, attr.column };
-            diag.severity  = ParseDiagnosticSeverity(attr.arguments[0]);
-            diag.ruleName  = attr.arguments[1];
+            diag.severity = ParseDiagnosticSeverity(attr.arguments[0]);
+            diag.ruleName = attr.arguments[1];
             m_data->diagnostics.push_back(std::move(diag));
         }
     }
@@ -1888,7 +1984,7 @@ void Parser::ParseFunction(const std::vector<Attribute>& attributes)
     // エントリーポイントかどうかの判定
     bool isEntryPoint = false;
     EntryPoint ep;
-    ep.name      = funcName;
+    ep.name = funcName;
     ep.sourceLoc = funcLoc;
 
     if (FindAttribute(attributes, "vertex"))
@@ -1924,6 +2020,9 @@ void Parser::ParseFunction(const std::vector<Attribute>& attributes)
     // --- 引数リストの解析 ---
     if (!Expect(TokenType::LeftParen, "関数の引数リスト開始")) return;
 
+    // 全関数共通で引数情報を収集する一時リスト
+    std::vector<FunctionArgument> parsedArguments;
+
     while (Current().type != TokenType::RightParen && !IsAtEnd() && !HasError())
     {
         // 各引数の属性
@@ -1933,7 +2032,7 @@ void Parser::ParseFunction(const std::vector<Attribute>& attributes)
         // 引数名
         if (Current().type != TokenType::Identifier)
         {
-            ReportErrorAtCurrent("関数の引数名が必要です");
+            ReportError("関数の引数名が必要です");
             return;
         }
         std::string paramName = Current().text;
@@ -1944,18 +2043,24 @@ void Parser::ParseFunction(const std::vector<Attribute>& attributes)
         std::string paramType = ParseType();
         if (HasError()) return;
 
-        // エントリーポイントの場合は入力として記録
+        // 引数情報を一時リストに記録（エントリーポイント・ヘルパー関数共通）
+        FunctionArgument arg;
+        arg.name = paramName;
+        arg.typeName = paramType;
+        parsedArguments.push_back(arg);
+
+        // エントリーポイントの場合はステージ入力としても記録
         if (isEntryPoint)
         {
             StageIO input;
-            input.name          = paramName;
-            input.typeName      = paramType;
-            input.direction     = IODirection::Input;
-            input.location      = GetAttributeUint(paramAttrs, "location");
-            input.index         = GetAttributeUint(paramAttrs, "index");
-            input.builtin       = GetAttributeString(paramAttrs, "builtin");
+            input.name = paramName;
+            input.typeName = paramType;
+            input.direction = IODirection::Input;
+            input.location = GetAttributeUint(paramAttrs, "location");
+            input.index = GetAttributeUint(paramAttrs, "index");
+            input.builtin = GetAttributeString(paramAttrs, "builtin");
             input.interpolation = ParseInterpolation(paramAttrs);
-            input.invariant     = (FindAttribute(paramAttrs, "invariant") != nullptr);
+            input.invariant = (FindAttribute(paramAttrs, "invariant") != nullptr);
             ep.inputs.push_back(std::move(input));
         }
 
@@ -1965,6 +2070,7 @@ void Parser::ParseFunction(const std::vector<Attribute>& attributes)
     if (!Expect(TokenType::RightParen, "関数の引数リスト終了")) return;
 
     // --- 戻り値型の解析（-> 型名） ---
+    std::string parsedReturnType;
     if (Current().type == TokenType::Arrow)
     {
         Advance(); // '->' を消費
@@ -1972,25 +2078,25 @@ void Parser::ParseFunction(const std::vector<Attribute>& attributes)
         // 戻り値に直接属性が付く場合（@builtin(position), @location(0) 等）
         auto returnAttrs = ParseAttributes();
         if (HasError()) return;
-        std::string returnType = ParseType();
+        parsedReturnType = ParseType();
         if (HasError()) return;
 
         if (isEntryPoint)
         {
-            ep.returnTypeName = returnType;
+            ep.returnTypeName = parsedReturnType;
 
             // 戻り値に属性が直接付いている場合はステージ出力として記録
             if (!returnAttrs.empty())
             {
                 StageIO output;
-                output.name          = "";
-                output.typeName      = returnType;
-                output.direction     = IODirection::Output;
-                output.location      = GetAttributeUint(returnAttrs, "location");
-                output.index         = GetAttributeUint(returnAttrs, "index");
-                output.builtin       = GetAttributeString(returnAttrs, "builtin");
+                output.name = "";
+                output.typeName = parsedReturnType;
+                output.direction = IODirection::Output;
+                output.location = GetAttributeUint(returnAttrs, "location");
+                output.index = GetAttributeUint(returnAttrs, "index");
+                output.builtin = GetAttributeString(returnAttrs, "builtin");
                 output.interpolation = ParseInterpolation(returnAttrs);
-                output.invariant     = (FindAttribute(returnAttrs, "invariant") != nullptr);
+                output.invariant = (FindAttribute(returnAttrs, "invariant") != nullptr);
                 ep.outputs.push_back(std::move(output));
             }
         }
@@ -2000,10 +2106,18 @@ void Parser::ParseFunction(const std::vector<Attribute>& attributes)
     auto bodyTokens = SaveFunctionBody();
 
     // 関数情報を登録（エントリーポイント・ヘルパー関数の両方）
-    // リソース使用解析（AnalyzeResourceUsage）で使用する
     FunctionInfo funcInfo;
-    funcInfo.name       = funcName;
+    funcInfo.name = funcName;
     funcInfo.bodyTokens = std::move(bodyTokens);
+    funcInfo.sourceLoc = funcLoc;
+    funcInfo.arguments = std::move(parsedArguments);
+    funcInfo.returnTypeName = parsedReturnType;
+
+    if (isEntryPoint)
+    {
+        funcInfo.stage = ep.stage;
+    }
+
     m_functions[funcName] = std::move(funcInfo);
 
     // エントリーポイントであればReflectionDataに追加
@@ -2012,6 +2126,7 @@ void Parser::ParseFunction(const std::vector<Attribute>& attributes)
         m_data->entryPoints.push_back(std::move(ep));
     }
 }
+
 
 /**
  * @brief 関数本体の波括弧ブロックのトークンを保存しつつスキップする
@@ -2030,7 +2145,7 @@ std::vector<Token> Parser::SaveFunctionBody()
 
     if (Current().type != TokenType::LeftBrace)
     {
-        ReportErrorAtCurrent("関数本体の開始に '{' が必要です");
+        ReportError("関数本体の開始に '{' が必要です");
         return bodyTokens;
     }
     Advance(); // 開き波括弧を消費（トークン列には含めない）
@@ -2069,12 +2184,13 @@ std::vector<Token> Parser::SaveFunctionBody()
  */
 void Parser::ParseAlias()
 {
+    SourceLocation aliasLoc = CurrentSourceLocation();
     Advance(); // 'alias' キーワードを消費
 
     // 別名
     if (Current().type != TokenType::Identifier)
     {
-        ReportErrorAtCurrent("alias宣言に型名がありません");
+        ReportError("alias宣言に型名がありません");
         return;
     }
     std::string aliasName = Current().text;
@@ -2085,6 +2201,14 @@ void Parser::ParseAlias()
     std::string originalType = ParseType();
     if (HasError()) return;
     Match(TokenType::Semicolon);
+
+    // alias情報を出力に記録
+    AliasDefinition aliasDef;
+    aliasDef.name         = aliasName;
+    aliasDef.originalType = originalType;
+    aliasDef.sourceLoc    = aliasLoc;
+    m_data->aliases.push_back(std::move(aliasDef));
+
 
     // 元の型のレイアウト情報を別名にもコピーする
     TypeLayout layout = CalculateTypeLayout(originalType);
@@ -2148,14 +2272,9 @@ TextureInfo Parser::ParseTextureInfo(const std::string& typeName) const
         auto commaPos = inner.find(',');
         if (commaPos != std::string::npos)
         {
-            info.texelFormat = inner.substr(0, commaPos);
-            while (!info.texelFormat.empty() && info.texelFormat.back() == ' ')
-                info.texelFormat.pop_back();
+            info.texelFormat = TrimString(inner.substr(0, commaPos));
 
-            std::string accessStr = inner.substr(commaPos + 1);
-            while (!accessStr.empty() && accessStr.front() == ' ')
-                accessStr.erase(accessStr.begin());
-
+            std::string accessStr = TrimString(inner.substr(commaPos + 1));
             if (accessStr == "read")            info.accessMode = AccessMode::Read;
             else if (accessStr == "write")      info.accessMode = AccessMode::Write;
             else if (accessStr == "read_write") info.accessMode = AccessMode::ReadWrite;
@@ -2228,48 +2347,23 @@ Parser::TypeLayout Parser::CalculateTypeLayout(const std::string& typeName) cons
     }
 
     // 3. 配列型の計算
-    const std::string arrayPrefix = "array<";
-    if (typeName.find(arrayPrefix) == 0)
+    auto arrayParts = SplitArrayInner(typeName);
+    if (arrayParts.has_value())
     {
-        // "array<" と末尾 ">" を除いた中身を取り出す
-        std::string inner = typeName.substr(
-            arrayPrefix.size(), typeName.size() - arrayPrefix.size() - 1);
-
-        // 最外のカンマ位置を山括弧のネスト深度を追跡して探す
-        int depth = 0;
-        size_t splitPos = std::string::npos;
-        for (size_t i = 0; i < inner.size(); i++)
+        if (arrayParts->hasCount)
         {
-            if (inner[i] == '<') depth++;
-            else if (inner[i] == '>') depth--;
-            else if (inner[i] == ',' && depth == 0) splitPos = i;
-        }
-
-        if (splitPos != std::string::npos)
-        {
-            // 要素型とカウントを分離
-            std::string elemType = inner.substr(0, splitPos);
-            while (!elemType.empty() && elemType.back() == ' ') elemType.pop_back();
-
-            std::string countStr = inner.substr(splitPos + 1);
-            while (!countStr.empty() && countStr.front() == ' ') countStr.erase(countStr.begin());
-
-            TypeLayout elemLayout = CalculateTypeLayout(elemType);
+            TypeLayout elemLayout = CalculateTypeLayout(arrayParts->elementType);
             uint32_t count = static_cast<uint32_t>(
-                std::strtoul(countStr.c_str(), nullptr, 0));
+                std::strtoul(arrayParts->countStr.c_str(), nullptr, 0));
 
             if (elemLayout.size > 0 && count > 0)
             {
-                // ストライド = 要素サイズをアライメントの倍数に切り上げ
                 uint32_t stride = elemLayout.size;
                 if (elemLayout.align > 0)
                     stride = (stride + elemLayout.align - 1) / elemLayout.align * elemLayout.align;
-
                 return { stride * count, elemLayout.align };
             }
         }
-
-        // サイズ未指定の実行時サイズ配列
         return { 0, 0 };
     }
 
@@ -2324,16 +2418,7 @@ void Parser::ResolveEntryPointIO(EntryPoint& entryPoint)
                 {
                     if (member.location.has_value() || member.builtin.has_value())
                     {
-                        StageIO expanded;
-                        expanded.name          = member.name;
-                        expanded.typeName      = member.typeName;
-                        expanded.direction     = IODirection::Input;
-                        expanded.location      = member.location;
-                        expanded.index         = member.index;
-                        expanded.builtin       = member.builtin;
-                        expanded.interpolation = member.interpolation;
-                        expanded.invariant     = member.invariant;
-                        resolvedInputs.push_back(std::move(expanded));
+                        resolvedInputs.push_back(MakeStageIOFromMember(member, IODirection::Input));
                     }
                 }
                 found = true;
@@ -2358,16 +2443,7 @@ void Parser::ResolveEntryPointIO(EntryPoint& entryPoint)
                 {
                     if (member.location.has_value() || member.builtin.has_value())
                     {
-                        StageIO output;
-                        output.name          = member.name;
-                        output.typeName      = member.typeName;
-                        output.direction     = IODirection::Output;
-                        output.location      = member.location;
-                        output.index         = member.index;
-                        output.builtin       = member.builtin;
-                        output.interpolation = member.interpolation;
-                        output.invariant     = member.invariant;
-                        entryPoint.outputs.push_back(std::move(output));
+                        entryPoint.outputs.push_back(MakeStageIOFromMember(member, IODirection::Output));
                     }
                 }
                 break;
@@ -2498,12 +2574,8 @@ void Parser::AnalyzeResourceUsage()
 
     for (auto& ep : m_data->entryPoints)
     {
-        // このエントリーポイントから推移的に使用される全リソースを収集
-        std::set<std::string> visited;
-        std::set<std::string> allResources =
-            ResolveTransitiveResources(ep.name, visited);
+        const auto& allResources = ResolveTransitiveResourcesCached(ep.name);
 
-        // リソース名をBindingReferenceに変換してentryPointに格納
         for (const auto& resName : allResources)
         {
             for (const auto& b : m_data->bindings)
@@ -2518,6 +2590,157 @@ void Parser::AnalyzeResourceUsage()
                 }
             }
         }
+    }
+}
+
+// ############################################################
+//  テクスチャとサンプラーの関連付け解析
+// ############################################################
+
+/**
+ * @brief 全関数の本体を走査し、テクスチャとサンプラーの使用ペアを検出する
+ *
+ * WGSLのテクスチャサンプリング組み込み関数は、第1引数にテクスチャ変数、
+ * 第2引数にサンプラー変数を取る。この関数はその呼び出しパターンを
+ * 全関数の本体トークンから検出し、テクスチャ-サンプラーのペアとして記録する。
+ *
+ * 検出対象の組み込み関数：
+ *   textureSample, textureSampleBias, textureSampleLevel,
+ *   textureSampleGrad, textureSampleCompare, textureSampleCompareLevel,
+ *   textureGather, textureGatherCompare
+ *
+ * 検出パターン：
+ *   関数名 ( テクスチャ変数名 , サンプラー変数名 , ...
+ *
+ * テクスチャ変数名とサンプラー変数名は、バインディングリソースとして
+ * 登録されている変数名と一致するかを確認して、誤検出を防ぐ。
+ * 同じペアの重複は除外する。
+ */
+void Parser::AnalyzeTextureSamplerRelations()
+{
+    // テクスチャサンプリング関数の一覧（第1引数=テクスチャ, 第2引数=サンプラー）
+    static const std::set<std::string> s_samplingFunctions = {
+        "textureSample",
+        "textureSampleBias",
+        "textureSampleLevel",
+        "textureSampleGrad",
+        "textureSampleCompare",
+        "textureSampleCompareLevel",
+        "textureGather",
+        "textureGatherCompare",
+    };
+
+    // バインディング変数名のうち、テクスチャとサンプラーを分類する
+    std::set<std::string> textureNames;
+    std::set<std::string> samplerNames;
+    for (const auto& b : m_data->bindings)
+    {
+        if (b.resourceType == ResourceType::Sampler ||
+            b.resourceType == ResourceType::ComparisonSampler)
+        {
+            samplerNames.insert(b.name);
+        }
+        else if (b.resourceType == ResourceType::SampledTexture     ||
+                 b.resourceType == ResourceType::MultisampledTexture ||
+                 b.resourceType == ResourceType::DepthTexture        ||
+                 b.resourceType == ResourceType::DepthMultisampledTexture ||
+                 b.resourceType == ResourceType::ExternalTexture)
+        {
+            textureNames.insert(b.name);
+        }
+    }
+
+    // 既に登録済みのペアの重複チェック用
+    std::set<std::pair<std::string, std::string>> foundPairs;
+
+    // 全関数の本体トークンを走査
+    for (const auto& [name, func] : m_functions)
+    {
+        const auto& tokens = func.bodyTokens;
+        for (size_t i = 0; i < tokens.size(); i++)
+        {
+            // サンプリング関数名を検出
+            if (tokens[i].type != TokenType::Identifier) continue;
+            if (s_samplingFunctions.count(tokens[i].text) == 0) continue;
+
+            // パターン: 関数名 ( テクスチャ名 , サンプラー名
+            // 最低5トークン先まで必要: ( texture , sampler
+            if (i + 4 >= tokens.size()) continue;
+            if (tokens[i + 1].type != TokenType::LeftParen) continue;
+            if (tokens[i + 2].type != TokenType::Identifier) continue;
+            if (tokens[i + 3].type != TokenType::Comma) continue;
+            if (tokens[i + 4].type != TokenType::Identifier) continue;
+
+            const std::string& firstArg  = tokens[i + 2].text;
+            const std::string& secondArg = tokens[i + 4].text;
+
+            // 第1引数がテクスチャ、第2引数がサンプラーであることを確認
+            if (textureNames.count(firstArg) == 0) continue;
+            if (samplerNames.count(secondArg) == 0) continue;
+
+            // 重複チェック
+            auto pairKey = std::make_pair(firstArg, secondArg);
+            if (foundPairs.count(pairKey)) continue;
+            foundPairs.insert(pairKey);
+
+            // ペアを記録
+            TextureSamplerPair pair;
+            pair.textureName = firstArg;
+            pair.samplerName = secondArg;
+            m_data->textureSamplerPairs.push_back(std::move(pair));
+        }
+    }
+}
+
+// ############################################################
+//  関数情報の公開用エクスポート
+// ############################################################
+
+/**
+ * @brief 内部のFunctionInfoをReflectionData::functionsにエクスポートする
+ *
+ * Parse中に収集した全関数の内部情報（FunctionInfo）を、
+ * 公開用のFunctionDefinition構造体に変換してReflectionDataに格納する。
+ *
+ * AnalyzeResourceUsage()の後に呼ぶことで、各関数の使用バインディング情報と
+ * 呼び出し関数情報が確定した状態でエクスポートされる。
+ */
+void Parser::ExportFunctionDefinitions()
+{
+    for (const auto& [name, func] : m_functions)
+    {
+        FunctionDefinition def;
+        def.name           = func.name;
+        def.stage          = func.stage;
+        def.arguments      = func.arguments;
+        def.returnTypeName = func.returnTypeName;
+        def.sourceLoc      = func.sourceLoc;
+
+        // 呼び出し関数名をvectorに変換
+        for (const auto& calledFunc : func.calledFunctions)
+        {
+            def.calledFunctions.push_back(calledFunc);
+        }
+
+        // この関数が使用するバインディングを推移的に収集（キャッシュ版を使用）
+        const auto& allResources = ResolveTransitiveResourcesCached(func.name);
+
+        for (const auto& resName : allResources)
+        {
+            for (const auto& b : m_data->bindings)
+            {
+                if (b.name == resName)
+                {
+                    BindingReference ref;
+                    ref.group   = b.group;
+                    ref.binding = b.binding;
+                    def.usedBindings.push_back(ref);
+                    break;
+                }
+            }
+        }
+
+        m_data->functions.push_back(std::move(def));
     }
 }
 

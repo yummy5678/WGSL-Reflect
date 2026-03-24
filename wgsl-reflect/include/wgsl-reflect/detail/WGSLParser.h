@@ -61,10 +61,14 @@ private:
      */
     struct FunctionInfo
     {
-        std::string          name;              // 関数名
-        std::vector<Token>   bodyTokens;        // 関数本体のトークン列（波括弧の中身）
-        std::set<std::string> directResourceRefs; // 本体内で直接参照されたバインディング変数名
-        std::set<std::string> calledFunctions;   // 本体内で呼び出されたユーザー定義関数名
+        std::string          name;                  // 関数名
+        std::vector<Token>   bodyTokens;            // 関数本体のトークン列（波括弧の中身）
+        std::set<std::string> directResourceRefs;   // 本体内で直接参照されたバインディング変数名
+        std::set<std::string> calledFunctions;      // 本体内で呼び出されたユーザー定義関数名
+        std::optional<ShaderStage> stage;           // エントリーポイントならステージ種別
+        std::vector<FunctionArgument> arguments;    // 引数リスト
+        std::string returnTypeName;                 // 戻り値型名
+        SourceLocation sourceLoc;                   // 宣言位置
     };
 
     std::vector<Token>  m_tokens;
@@ -75,11 +79,11 @@ private:
     std::unordered_map<std::string, std::string> m_constantValues;
     std::unordered_map<std::string, TypeLayout>  m_typeLayouts;
 
-    uint32_t m_nextOverrideId = 0;
-
     // --- リソース使用解析用 ---
     /// 全関数の本体情報（関数名→FunctionInfo）
     std::unordered_map<std::string, FunctionInfo> m_functions;
+    /// 推移的リソース解決のキャッシュ（関数名→使用バインディング変数名の集合）
+    std::unordered_map<std::string, std::set<std::string>> m_transitiveResourceCache;
 
     // --- トークン操作 ---
     const Token& Current() const;
@@ -91,7 +95,6 @@ private:
 
     // --- エラー処理 ---
     void ReportError(const std::string& message);
-    void ReportErrorAtCurrent(const std::string& message);
     bool HasError() const;
 
     // --- 解析処理 ---
@@ -139,6 +142,37 @@ private:
     std::set<std::string> ResolveTransitiveResources(
         const std::string& funcName,
         std::set<std::string>& visited) const;
+
+    // --- テクスチャ-サンプラー関連付け解析 ---
+    /// @brief 全関数の本体を走査し、テクスチャとサンプラーの使用ペアを検出する
+    void AnalyzeTextureSamplerRelations();
+
+    // --- 関数情報の公開用エクスポート ---
+    /// @brief 内部のFunctionInfoをReflectionData::functionsにエクスポートする
+    void ExportFunctionDefinitions();
+
+    // --- ユーティリティ ---
+    /// @brief 文字列の前後の空白を除去する
+    static std::string TrimString(const std::string& str);
+
+    /// @brief StructMemberからStageIOを生成する
+    static StageIO MakeStageIOFromMember(const StructMember& member, IODirection direction);
+
+    /// @brief "array<...>"の内部文字列から要素型と要素数文字列に分割する
+    struct ArrayInnerParts { std::string elementType; std::string countStr; bool hasCount; };
+    static std::optional<ArrayInnerParts> SplitArrayInner(const std::string& typeName);
+
+    /// @brief 組み込み関数を整数引数で評価する（該当しなければnullopt）
+    static std::optional<int64_t> EvaluateBuiltinFunctionInt(
+        const std::string& name, const std::vector<int64_t>& args);
+
+    /// @brief 組み込み関数を浮動小数点引数で評価する（該当しなければnullopt）
+    static std::optional<double> EvaluateBuiltinFunctionFloat(
+        const std::string& name, const std::vector<double>& args);
+
+    /// @brief 推移的リソース解決（キャッシュ付き）
+    const std::set<std::string>& ResolveTransitiveResourcesCached(const std::string& funcName);
+
 };
 
 } // namespace wgsl_reflect

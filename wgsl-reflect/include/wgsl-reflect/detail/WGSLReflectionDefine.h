@@ -348,21 +348,91 @@ struct FlattenedMember
 };
 
 // ============================================================
+//  テクスチャとサンプラーの関連付け
+// ============================================================
+
+/**
+ * @brief テクスチャとサンプラーの使用ペア
+ *
+ * シェーダー内の textureSample() 等の呼び出しから検出された、
+ * テクスチャ変数とサンプラー変数の組み合わせ。
+ * WebGPUではバインドグループレイアウト作成時に、テクスチャが
+ * フィルタリングサンプラーを使うか非フィルタリングサンプラーを使うかを
+ * 指定する必要があり、この情報で自動判定できる。
+ */
+struct TextureSamplerPair
+{
+    std::string textureName; // テクスチャ変数名
+    std::string samplerName; // サンプラー変数名
+};
+
+// ============================================================
+//  型の別名定義
+// ============================================================
+
+/**
+ * @brief alias宣言の情報
+ *
+ * WGSLの alias 宣言で定義された型の別名。
+ * 元の型名と別名の対応関係を保持する。
+ */
+struct AliasDefinition
+{
+    std::string name;         // 別名
+    std::string originalType; // 元の型名
+    SourceLocation sourceLoc; // ソースコード上の宣言位置
+};
+
+// ============================================================
+//  関数定義
+// ============================================================
+
+/**
+ * @brief 関数の引数情報
+ */
+struct FunctionArgument
+{
+    std::string name;     // 引数名
+    std::string typeName; // 型名
+};
+
+/**
+ * @brief 関数の定義情報（エントリーポイント・ヘルパー関数の両方）
+ *
+ * シェーダー内の全関数（エントリーポイントとヘルパー関数）の
+ * シグネチャと使用リソース情報を保持する。
+ * calledFunctionsには直接呼び出すユーザー定義関数名のみを含み、
+ * 組み込み関数は含まない。
+ */
+struct FunctionDefinition
+{
+    std::string name;                             // 関数名
+    std::optional<ShaderStage> stage;             // エントリーポイントならステージ種別、ヘルパー関数ならnullopt
+    std::vector<FunctionArgument> arguments;      // 引数リスト
+    std::string returnTypeName;                   // 戻り値型名（voidなら空文字列）
+    std::vector<BindingReference> usedBindings;   // この関数が直接的・間接的に使用するバインディング
+    std::vector<std::string> calledFunctions;     // この関数が直接呼び出すユーザー定義関数名
+    SourceLocation sourceLoc;                     // ソースコード上の宣言位置
+};
+
+// ============================================================
 //  リフレクション結果
 // ============================================================
 
 struct ReflectionData
 {
-    std::vector<BindingResource>     bindings;
-    std::vector<StructDefinition>    structs;
-    std::vector<EntryPoint>          entryPoints;
-    std::vector<OverrideConstant>    overrideConstants;
-    std::vector<EnableDirective>     enables;
-    std::vector<RequiresDirective>   requires_;
-    std::vector<DiagnosticDirective> diagnostics;
+    std::vector<BindingResource>      bindings;
+    std::vector<StructDefinition>     structs;
+    std::vector<EntryPoint>           entryPoints;
+    std::vector<OverrideConstant>     overrideConstants;
+    std::vector<EnableDirective>      enables;
+    std::vector<RequiresDirective>    requires_;
+    std::vector<DiagnosticDirective>  diagnostics;
+    std::vector<TextureSamplerPair>   textureSamplerPairs; // テクスチャとサンプラーの使用ペア
+    std::vector<AliasDefinition>      aliases;             // alias宣言の一覧
+    std::vector<FunctionDefinition>   functions;           // 全関数の一覧
     std::unordered_map<std::string, std::string> constants;
 };
-
 struct ErrorInfo
 {
     uint32_t    line    = 0;
@@ -388,5 +458,24 @@ ReflectionResult Reflect(const std::string& source, ReflectionData& outData);
 std::vector<FlattenedMember> FlattenStruct(
     const ReflectionData& data,
     const std::string& structName);
+
+ /**
+ * @brief バインディングリソースをグループ番号とバインディング番号の2次元配列に整理する
+ *
+ * 戻り値の外側の配列のインデックスがグループ番号、内側の配列のインデックスが
+ * バインディング番号に対応する。空きインデックスにはnullptrが入る。
+ * WebGPUのバインドグループレイアウト（GPUBindGroupLayoutDescriptor）を
+ * 構築する際にそのまま走査できる形式。
+ */
+std::vector<std::vector<const BindingResource*>> GetBindGroups(
+    const ReflectionData& data);
+
+/**
+ * @brief 指定したグループ番号とバインディング番号に一致するリソースを検索する
+ */
+const BindingResource* FindResource(
+    const ReflectionData& data,
+    uint32_t group,
+    uint32_t binding);
 
 } // namespace wgsl_reflect

@@ -228,4 +228,83 @@ std::vector<FlattenedMember> FlattenStruct(
     return result;
 }
 
+/**
+ * @brief バインディングリソースをグループ番号×バインディング番号の2次元配列に整理する
+ * @param data Reflect()で取得済みのリフレクション結果
+ * @return 2次元配列。result[group][binding] でリソースへのポインタを取得できる。
+ *         該当するリソースがないスロットにはnullptrが入る。
+ *
+ * WebGPUでは描画コマンドの発行前にバインドグループを設定する必要がある。
+ * バインドグループの作成にはグループごとにどのバインディングに何のリソースが
+ * 入るかの情報が必要になる。この関数はフラットなバインディング配列を
+ * グループ×バインディングの形式に整理して、レイアウト構築を容易にする。
+ *
+ * 例:
+ *   group(0) binding(0) → uniform buffer
+ *   group(0) binding(1) → storage buffer
+ *   group(1) binding(0) → texture
+ *   group(1) binding(1) → sampler
+ *
+ *   result[0][0] → uniform bufferへのポインタ
+ *   result[0][1] → storage bufferへのポインタ
+ *   result[1][0] → textureへのポインタ
+ *   result[1][1] → samplerへのポインタ
+ */
+std::vector<std::vector<const BindingResource*>> GetBindGroups(
+    const ReflectionData& data)
+{
+    // バインディングがなければ空の配列を返す
+    if (data.bindings.empty()) return {};
+
+    // グループ番号の最大値を求める
+    uint32_t maxGroup = 0;
+    for (const auto& b : data.bindings)
+    {
+        if (b.group > maxGroup) maxGroup = b.group;
+    }
+
+    // 各グループ内のバインディング番号の最大値を求める
+    std::vector<uint32_t> maxBinding(maxGroup + 1, 0);
+    for (const auto& b : data.bindings)
+    {
+        if (b.binding > maxBinding[b.group])
+            maxBinding[b.group] = b.binding;
+    }
+
+    // 2次元配列をnullptrで初期化
+    std::vector<std::vector<const BindingResource*>> result(maxGroup + 1);
+    for (uint32_t g = 0; g <= maxGroup; g++)
+    {
+        result[g].resize(maxBinding[g] + 1, nullptr);
+    }
+
+    // リソースを対応するスロットに配置
+    for (const auto& b : data.bindings)
+    {
+        result[b.group][b.binding] = &b;
+    }
+
+    return result;
+}
+
+/**
+ * @brief 指定したグループ番号とバインディング番号に一致するリソースを検索する
+ * @param data    Reflect()で取得済みのリフレクション結果
+ * @param group   検索するグループ番号
+ * @param binding 検索するバインディング番号
+ * @return 一致するリソースへのポインタ。見つからなければnullptr
+ */
+const BindingResource* FindResource(
+    const ReflectionData& data,
+    uint32_t group,
+    uint32_t binding)
+{
+    for (const auto& b : data.bindings)
+    {
+        if (b.group == group && b.binding == binding)
+            return &b;
+    }
+    return nullptr;
+}
+
 } // namespace wgsl_reflect

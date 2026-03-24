@@ -771,6 +771,88 @@ int main()
         std::cout << "  コメントのみ: 正常に成功（ネストブロックコメント対応確認）\n";
     }
 
+    // ========================================
+    //  テクスチャ-サンプラー関連付け
+    // ========================================
+    PrintSection("テクスチャ-サンプラー関連付け");
+    std::cout << "  ペア数: " << data.textureSamplerPairs.size() << "\n";
+    for (const auto& pair : data.textureSamplerPairs)
+    {
+        std::cout << "    " << pair.textureName << " <-> " << pair.samplerName << "\n";
+    }
+    // fs_mainで textureSample(diffuseTexture, texSampler, ...) を使用
+    bool foundDiffuseSamplerPair = false;
+    for (const auto& pair : data.textureSamplerPairs)
+    {
+        if (pair.textureName == "diffuseTexture" && pair.samplerName == "texSampler")
+            foundDiffuseSamplerPair = true;
+    }
+    assert(foundDiffuseSamplerPair);
+
+    // ========================================
+    //  GetBindGroups
+    // ========================================
+    PrintSection("GetBindGroups");
+    auto bindGroups = wgsl_reflect::GetBindGroups(data);
+    std::cout << "  グループ数: " << bindGroups.size() << "\n";
+    for (size_t g = 0; g < bindGroups.size(); g++)
+    {
+        std::cout << "  group(" << g << "): " << bindGroups[g].size() << " バインディング\n";
+        for (size_t b = 0; b < bindGroups[g].size(); b++)
+        {
+            if (bindGroups[g][b])
+                std::cout << "    [" << b << "] " << bindGroups[g][b]->name << "\n";
+            else
+                std::cout << "    [" << b << "] (空)\n";
+        }
+    }
+    assert(bindGroups.size() == 2);
+    assert(bindGroups[0][0] != nullptr);
+    assert(bindGroups[0][0]->name == "scene");
+    assert(bindGroups[1][4] != nullptr);
+    assert(bindGroups[1][4]->name == "texSampler");
+
+    // FindResource
+    auto found = wgsl_reflect::FindResource(data, 1, 0);
+    assert(found != nullptr);
+    assert(found->name == "diffuseTexture");
+    auto notFound = wgsl_reflect::FindResource(data, 99, 99);
+    assert(notFound == nullptr);
+
+    // ========================================
+    //  alias情報
+    // ========================================
+    PrintSection("alias情報");
+    std::cout << "  alias数: " << data.aliases.size() << "\n";
+    for (const auto& a : data.aliases)
+    {
+        std::cout << "    " << a.name << " = " << a.originalType << "\n";
+    }
+    assert(data.aliases.size() == 1);
+    assert(data.aliases[0].name == "Color");
+    assert(data.aliases[0].originalType == "vec4<f32>");
+
+    // ========================================
+    //  全関数情報
+    // ========================================
+    PrintSection("全関数情報");
+    std::cout << "  関数数: " << data.functions.size() << "\n";
+    for (const auto& fn : data.functions)
+    {
+        std::cout << "    " << fn.name;
+        if (fn.stage.has_value())
+            std::cout << " [" << ShaderStageToString(fn.stage.value()) << "]";
+        else
+            std::cout << " [ヘルパー]";
+        std::cout << " 引数=" << fn.arguments.size()
+            << " 使用バインディング=" << fn.usedBindings.size()
+            << " 呼び出し関数=" << fn.calledFunctions.size();
+        if (!fn.returnTypeName.empty())
+            std::cout << " 戻り値=" << fn.returnTypeName;
+        std::cout << "\n";
+    }
+    assert(data.functions.size() == 3); // vs_main, fs_main, cs_update
+
     std::cout << "\n=== 全テスト完了 ===\n";
 
     return 0;
